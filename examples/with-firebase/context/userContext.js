@@ -19,7 +19,7 @@ export default function UserContextComp({ children }) {
           setUser({ uid, displayName, email, photoURL })
         } else setUser(null)
       } catch (error) {
-        // Most probably a connection error. Handle appropiately.
+        // Most probably a connection error. Handle appropriately.
       } finally {
         setLoadingUser(false)
       }
@@ -36,5 +36,5 @@ export default function UserContextComp({ children }) {
   )
 }
 
-// Custom hook that shorhands the context!
+// Custom hook that shorthands the context!
 export const useUser = () => useContext(UserContext)

@@ -1,5 +1,4 @@
-import React from 'react'
-import { Flex, useColorMode } from '@chakra-ui/core'
+import { Flex, useColorMode } from '@chakra-ui/react'
 
 export const Container = (props) => {
   const { colorMode } = useColorMode()

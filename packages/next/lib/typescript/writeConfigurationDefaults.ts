@@ -1,5 +1,5 @@
 import { promises as fs } from 'fs'
-import chalk from 'next/dist/compiled/chalk'
+import chalk from 'chalk'
 import * as CommentJson from 'next/dist/compiled/comment-json'
 import os from 'os'
 import { getTypeScriptConfiguration } from './getTypeScriptConfiguration'
@@ -7,7 +7,12 @@ import { getTypeScriptConfiguration } from './getTypeScriptConfiguration'
 type DesiredCompilerOptionsShape = {
   [key: string]:
     | { suggested: any }
-    | { parsedValue?: any; value: any; reason: string }
+    | {
+        parsedValue?: any
+        parsedValues?: Array<any>
+        value: any
+        reason: string
+      }
 }
 
 function getDesiredCompilerOptions(
@@ -33,6 +38,13 @@ function getDesiredCompilerOptions(
     },
     module: {
       parsedValue: ts.ModuleKind.ESNext,
+      // All of these values work:
+      parsedValues: [
+        ts.ModuleKind.ES2020,
+        ts.ModuleKind.ESNext,
+        ts.ModuleKind.CommonJS,
+        ts.ModuleKind.AMD,
+      ],
       value: 'esnext',
       reason: 'for dynamic import() support',
     },
@@ -83,16 +95,16 @@ export async function writeConfigurationDefaults(
   }
 
   const desiredCompilerOptions = getDesiredCompilerOptions(ts)
-  const effectiveConfiguration = await getTypeScriptConfiguration(
-    ts,
-    tsConfigPath
-  )
+  const {
+    options: tsOptions,
+    raw: rawConfig,
+  } = await getTypeScriptConfiguration(ts, tsConfigPath)
 
   const userTsConfigContent = await fs.readFile(tsConfigPath, {
     encoding: 'utf8',
   })
   const userTsConfig = CommentJson.parse(userTsConfigContent)
-  if (userTsConfig.compilerOptions == null) {
+  if (userTsConfig.compilerOptions == null && !('extends' in rawConfig)) {
     userTsConfig.compilerOptions = {}
     isFirstTimeSetup = true
   }
@@ -102,16 +114,18 @@ export async function writeConfigurationDefaults(
   for (const optionKey of Object.keys(desiredCompilerOptions)) {
     const check = desiredCompilerOptions[optionKey]
     if ('suggested' in check) {
-      if (!(optionKey in effectiveConfiguration.options)) {
+      if (!(optionKey in tsOptions)) {
         userTsConfig.compilerOptions[optionKey] = check.suggested
         suggestedActions.push(
           chalk.cyan(optionKey) + ' was set to ' + chalk.bold(check.suggested)
         )
       }
     } else if ('value' in check) {
-      const ev = effectiveConfiguration.options[optionKey]
+      const ev = tsOptions[optionKey]
       if (
-        !('parsedValue' in check
+        !('parsedValues' in check
+          ? check.parsedValues?.includes(ev)
+          : 'parsedValue' in check
           ? check.parsedValue === ev
           : check.value === ev)
       ) {
@@ -129,7 +143,7 @@ export async function writeConfigurationDefaults(
     }
   }
 
-  if (userTsConfig.include == null) {
+  if (!('include' in rawConfig)) {
     userTsConfig.include = ['next-env.d.ts', '**/*.ts', '**/*.tsx']
     suggestedActions.push(
       chalk.cyan('include') +
@@ -138,7 +152,7 @@ export async function writeConfigurationDefaults(
     )
   }
 
-  if (userTsConfig.exclude == null) {
+  if (!('exclude' in rawConfig)) {
     userTsConfig.exclude = ['node_modules']
     suggestedActions.push(
       chalk.cyan('exclude') + ' was set to ' + chalk.bold(`['node_modules']`)

@@ -1,7 +1,7 @@
 import Mux from '@mux/mux-node'
 const { Video } = new Mux()
 
-export default async function uploadHandler(req, res) {
+export default async function assetHandler(req, res) {
   const { method } = req
 
   switch (method) {
@@ -17,9 +17,8 @@ export default async function uploadHandler(req, res) {
           },
         })
       } catch (e) {
-        res.statusCode = 500
         console.error('Request error', e)
-        res.json({ error: 'Error getting upload/asset' })
+        res.status(500).json({ error: 'Error getting upload/asset' })
       }
       break
     default:

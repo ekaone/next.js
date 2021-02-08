@@ -51,6 +51,15 @@ const runTests = (isDev = false) => {
     const $ = cheerio.load(html)
     expect($('#use-amp').text()).toContain('no')
     expect($('#hello').text()).toContain('hello')
+    expect($('#slug').text()).toContain('post-1')
+  })
+
+  it('should load dynamic hybrid SSG/AMP page with trailing slash', async () => {
+    const html = await renderViaHTTP(appPort, '/blog/post-1/')
+    const $ = cheerio.load(html)
+    expect($('#use-amp').text()).toContain('no')
+    expect($('#hello').text()).toContain('hello')
+    expect($('#slug').text()).toContain('post-1')
   })
 
   it('should load dynamic hybrid SSG/AMP page with query', async () => {
@@ -58,6 +67,7 @@ const runTests = (isDev = false) => {
     const $ = cheerio.load(html)
     expect($('#use-amp').text()).toContain('yes')
     expect($('#hello').text()).toContain('hello')
+    expect($('#slug').text()).toContain('post-1')
   })
 
   it('should load a hybrid amp page with query correctly', async () => {
@@ -117,13 +127,8 @@ describe('AMP SSG Support', () => {
       await nextBuild(appDir)
       appPort = await findPort()
       app = await nextStart(appDir, appPort)
-      const buildId = await fs.readFile(join(appDir, '.next/BUILD_ID'), 'utf8')
-      builtServerPagesDir = join(
-        appDir,
-        '.next/server/static',
-        buildId,
-        'pages'
-      )
+      // TODO: use browser instead to do checks that now need filesystem access
+      builtServerPagesDir = join(appDir, '.next', 'server', 'pages')
     })
     afterAll(() => killApp(app))
     runTests()

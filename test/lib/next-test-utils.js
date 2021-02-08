@@ -1,21 +1,26 @@
-import fetch from 'node-fetch'
-import qs from 'querystring'
-import http from 'http'
-import express from 'express'
-import path from 'path'
-import getPort from 'get-port'
 import spawn from 'cross-spawn'
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs'
-import treeKill from 'tree-kill'
-
+import express from 'express'
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
+import getPort from 'get-port'
+import http from 'http'
 // `next` here is the symlink in `test/node_modules/next` which points to the root directory.
 // This is done so that requiring from `next` works.
 // The reason we don't import the relative path `../../dist/<etc>` is that it would lead to inconsistent module singletons
 import server from 'next/dist/server/next'
 import _pkg from 'next/package.json'
+import fetch from 'node-fetch'
+import path from 'path'
+import qs from 'querystring'
+import treeKill from 'tree-kill'
 
 export const nextServer = server
 export const pkg = _pkg
+
+// polyfill Object.fromEntries for the test/integration/relay-analytics tests
+// on node 10, this can be removed after we no longer support node 10
+if (!Object.fromEntries) {
+  Object.fromEntries = require('core-js/features/object/from-entries')
+}
 
 export function initNextServerScript(
   scriptPath,
@@ -25,7 +30,7 @@ export function initNextServerScript(
   opts
 ) {
   return new Promise((resolve, reject) => {
-    const instance = spawn('node', [scriptPath], { env })
+    const instance = spawn('node', ['--no-deprecation', scriptPath], { env })
 
     function handleStdout(data) {
       const message = data.toString()
@@ -71,8 +76,8 @@ export function renderViaAPI(app, pathname, query) {
   return app.renderToHTML({ url }, {}, pathname, query)
 }
 
-export function renderViaHTTP(appPort, pathname, query) {
-  return fetchViaHTTP(appPort, pathname, query).then((res) => res.text())
+export function renderViaHTTP(appPort, pathname, query, opts) {
+  return fetchViaHTTP(appPort, pathname, query, opts).then((res) => res.text())
 }
 
 export function fetchViaHTTP(appPort, pathname, query, opts) {
@@ -100,7 +105,7 @@ export function runNextCommand(argv, options = {}) {
 
   return new Promise((resolve, reject) => {
     console.log(`Running command "next ${argv.join(' ')}"`)
-    const instance = spawn('node', [nextBin, ...argv], {
+    const instance = spawn('node', ['--no-deprecation', nextBin, ...argv], {
       ...options.spawnOptions,
       cwd,
       env,
@@ -125,9 +130,19 @@ export function runNextCommand(argv, options = {}) {
       })
     }
 
-    instance.on('close', (code) => {
+    instance.on('close', (code, signal) => {
+      if (
+        !options.stderr &&
+        !options.stdout &&
+        !options.ignoreFail &&
+        code !== 0
+      ) {
+        return reject(new Error(`command failed with code ${code}`))
+      }
+
       resolve({
         code,
+        signal,
         stdout: stdoutOutput,
         stderr: stderrOutput,
       })
@@ -151,7 +166,11 @@ export function runNextCommandDev(argv, stdOut, opts = {}) {
   }
 
   return new Promise((resolve, reject) => {
-    const instance = spawn('node', ['dist/bin/next', ...argv], { cwd, env })
+    const instance = spawn(
+      'node',
+      ['--no-deprecation', 'dist/bin/next', ...argv],
+      { cwd, env }
+    )
     let didResolve = false
 
     function handleStdout(data) {
@@ -238,7 +257,7 @@ export function buildTS(args = [], cwd, env = {}) {
   return new Promise((resolve, reject) => {
     const instance = spawn(
       'node',
-      [require.resolve('typescript/lib/tsc'), ...args],
+      ['--no-deprecation', require.resolve('typescript/lib/tsc'), ...args],
       { cwd, env }
     )
     let output = ''
@@ -347,7 +366,11 @@ export async function check(contentFn, regex, hardError = true) {
   for (let tries = 0; tries < 30; tries++) {
     try {
       content = await contentFn()
-      if (regex.test(content)) {
+      if (typeof regex === 'string') {
+        if (regex === content) {
+          return true
+        }
+      } else if (regex.test(content)) {
         // found the content
         return true
       }
@@ -381,7 +404,24 @@ export class File {
   }
 
   replace(pattern, newValue) {
-    const newContent = this.originalContent.replace(pattern, newValue)
+    const currentContent = readFileSync(this.path, 'utf8')
+    if (pattern instanceof RegExp) {
+      if (!pattern.test(currentContent)) {
+        throw new Error(
+          `Failed to replace content.\n\nPattern: ${pattern.toString()}\n\nContent: ${currentContent}`
+        )
+      }
+    } else if (typeof pattern === 'string') {
+      if (!currentContent.includes(pattern)) {
+        throw new Error(
+          `Failed to replace content.\n\nPattern: ${pattern}\n\nContent: ${currentContent}`
+        )
+      }
+    } else {
+      throw new Error(`Unknown replacement attempt type: ${pattern}`)
+    }
+
+    const newContent = currentContent.replace(pattern, newValue)
     this.write(newContent)
   }
 
@@ -401,6 +441,33 @@ export async function evaluate(browser, input) {
     return result
   } else {
     throw new Error(`You must pass a function to be evaluated in the browser.`)
+  }
+}
+
+export async function retry(fn, duration = 3000, interval = 500, description) {
+  if (duration % interval !== 0) {
+    throw new Error(
+      `invalid duration ${duration} and interval ${interval} mix, duration must be evenly divisible by interval`
+    )
+  }
+
+  for (let i = duration; i >= 0; i -= interval) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (i === 0) {
+        console.error(
+          `Failed to retry${
+            description ? ` ${description}` : ''
+          } within ${duration}ms`
+        )
+        throw err
+      }
+      console.warn(
+        `Retrying${description ? ` ${description}` : ''} in ${interval}ms`
+      )
+      await waitFor(interval)
+    }
   }
 }
 
@@ -431,28 +498,43 @@ export async function hasRedbox(browser, expected = true) {
 }
 
 export async function getRedboxHeader(browser) {
-  return evaluate(browser, () => {
-    const portal = [].slice
-      .call(document.querySelectorAll('nextjs-portal'))
-      .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-header'))
-    const root = portal.shadowRoot
-    return root.querySelector('[data-nextjs-dialog-header]').innerText
-  })
+  return retry(
+    () =>
+      evaluate(browser, () => {
+        const portal = [].slice
+          .call(document.querySelectorAll('nextjs-portal'))
+          .find((p) => p.shadowRoot.querySelector('[data-nextjs-dialog-header'))
+        const root = portal.shadowRoot
+        return root
+          .querySelector('[data-nextjs-dialog-header]')
+          .innerText.replace(/__WEBPACK_DEFAULT_EXPORT__/, 'Unknown')
+      }),
+    3000,
+    500,
+    'getRedboxHeader'
+  )
 }
 
 export async function getRedboxSource(browser) {
-  return evaluate(browser, () => {
-    const portal = [].slice
-      .call(document.querySelectorAll('nextjs-portal'))
-      .find((p) =>
-        p.shadowRoot.querySelector(
-          '#nextjs__container_errors_label, #nextjs__container_build_error_label'
-        )
-      )
-    const root = portal.shadowRoot
-    return root.querySelector('[data-nextjs-codeframe], [data-nextjs-terminal]')
-      .innerText
-  })
+  return retry(
+    () =>
+      evaluate(browser, () => {
+        const portal = [].slice
+          .call(document.querySelectorAll('nextjs-portal'))
+          .find((p) =>
+            p.shadowRoot.querySelector(
+              '#nextjs__container_errors_label, #nextjs__container_build_error_label'
+            )
+          )
+        const root = portal.shadowRoot
+        return root
+          .querySelector('[data-nextjs-codeframe], [data-nextjs-terminal]')
+          .innerText.replace(/__WEBPACK_DEFAULT_EXPORT__/, 'Unknown')
+      }),
+    3000,
+    500,
+    'getRedboxSource'
+  )
 }
 
 export function getBrowserBodyText(browser) {
@@ -461,4 +543,60 @@ export function getBrowserBodyText(browser) {
 
 export function normalizeRegEx(src) {
   return new RegExp(src).source.replace(/\^\//g, '^\\/')
+}
+
+function readJson(path) {
+  return JSON.parse(readFileSync(path))
+}
+
+export function getBuildManifest(dir) {
+  return readJson(path.join(dir, '.next/build-manifest.json'))
+}
+
+export function getPageFileFromBuildManifest(dir, page) {
+  const buildManifest = getBuildManifest(dir)
+  const pageFiles = buildManifest.pages[page]
+  if (!pageFiles) {
+    throw new Error(`No files for page ${page}`)
+  }
+
+  const pageFile = pageFiles.find(
+    (file) =>
+      file.endsWith('.js') &&
+      file.includes(`pages${page === '' ? '/index' : page}`)
+  )
+  if (!pageFile) {
+    throw new Error(`No page file for page ${page}`)
+  }
+
+  return pageFile
+}
+
+export function readNextBuildClientPageFile(appDir, page) {
+  const pageFile = getPageFileFromBuildManifest(appDir, page)
+  return readFileSync(path.join(appDir, '.next', pageFile), 'utf8')
+}
+
+export function getPagesManifest(dir) {
+  const serverFile = path.join(dir, '.next/server/pages-manifest.json')
+
+  if (existsSync(serverFile)) {
+    return readJson(serverFile)
+  }
+  return readJson(path.join(dir, '.next/serverless/pages-manifest.json'))
+}
+
+export function getPageFileFromPagesManifest(dir, page) {
+  const pagesManifest = getPagesManifest(dir)
+  const pageFile = pagesManifest[page]
+  if (!pageFile) {
+    throw new Error(`No file for page ${page}`)
+  }
+
+  return pageFile
+}
+
+export function readNextBuildServerPageFile(appDir, page) {
+  const pageFile = getPageFileFromPagesManifest(appDir, page)
+  return readFileSync(path.join(appDir, '.next', 'server', pageFile), 'utf8')
 }

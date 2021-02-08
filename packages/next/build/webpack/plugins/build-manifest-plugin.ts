@@ -1,85 +1,170 @@
 import devalue from 'next/dist/compiled/devalue'
-import { Compiler } from 'webpack'
-import { RawSource } from 'webpack-sources'
+import {
+  webpack,
+  isWebpack5,
+  sources,
+} from 'next/dist/compiled/webpack/webpack'
 import {
   BUILD_MANIFEST,
   CLIENT_STATIC_FILES_PATH,
   CLIENT_STATIC_FILES_RUNTIME_MAIN,
   CLIENT_STATIC_FILES_RUNTIME_POLYFILLS,
   CLIENT_STATIC_FILES_RUNTIME_REACT_REFRESH,
-  IS_BUNDLED_PAGE_REGEX,
+  CLIENT_STATIC_FILES_RUNTIME_AMP,
 } from '../../../next-server/lib/constants'
 import { BuildManifest } from '../../../next-server/server/get-page-files'
 import getRouteFromEntrypoint from '../../../next-server/server/get-route-from-entrypoint'
+import { ampFirstEntryNamesMap } from './next-drop-client-page-plugin'
+import { Rewrite } from '../../../lib/load-custom-routes'
+import { getSortedRoutes } from '../../../next-server/lib/router/utils'
+import { tracer, traceFn } from '../../tracer'
+import { spans } from './profiling-plugin'
+
+type DeepMutable<T> = { -readonly [P in keyof T]: DeepMutable<T[P]> }
+
+export type ClientBuildManifest = Record<string, string[]>
 
 // This function takes the asset map generated in BuildManifestPlugin and creates a
 // reduced version to send to the client.
-const generateClientManifest = (
+function generateClientManifest(
+  compiler: any,
   assetMap: BuildManifest,
-  isModern: boolean
-): string => {
-  const clientManifest: { [s: string]: string[] } = {}
-  const appDependencies = new Set(assetMap.pages['/_app'])
+  rewrites: Rewrite[]
+): string {
+  return tracer.withSpan(spans.get(compiler), () => {
+    const span = tracer.startSpan('NextJsBuildManifest-generateClientManifest')
+    return traceFn(span, () => {
+      const clientManifest: ClientBuildManifest = {
+        // TODO: update manifest type to include rewrites
+        __rewrites: rewrites as any,
+      }
+      const appDependencies = new Set(assetMap.pages['/_app'])
+      const sortedPageKeys = getSortedRoutes(Object.keys(assetMap.pages))
 
-  Object.entries(assetMap.pages).forEach(([page, dependencies]) => {
-    if (page === '/_app' || page === '/_polyfills') return
-    // Filter out dependencies in the _app entry, because those will have already
-    // been loaded by the client prior to a navigation event
-    const filteredDeps = dependencies.filter(
-      (dep) =>
-        !appDependencies.has(dep) &&
-        (!dep.endsWith('.js') || dep.endsWith('.module.js') === isModern)
-    )
+      sortedPageKeys.forEach((page) => {
+        const dependencies = assetMap.pages[page]
 
-    // The manifest can omit the page if it has no requirements
-    if (filteredDeps.length) {
-      clientManifest[page] = filteredDeps
-    }
+        if (page === '/_app') return
+        // Filter out dependencies in the _app entry, because those will have already
+        // been loaded by the client prior to a navigation event
+        const filteredDeps = dependencies.filter(
+          (dep) => !appDependencies.has(dep)
+        )
+
+        // The manifest can omit the page if it has no requirements
+        if (filteredDeps.length) {
+          clientManifest[page] = filteredDeps
+        }
+      })
+      // provide the sorted pages as an array so we don't rely on the object's keys
+      // being in order and we don't slow down look-up time for page assets
+      clientManifest.sortedPages = sortedPageKeys
+
+      return devalue(clientManifest)
+    })
   })
-  return devalue(clientManifest)
+}
+
+function isJsFile(file: string): boolean {
+  // We don't want to include `.hot-update.js` files into the initial page
+  return !file.endsWith('.hot-update.js') && file.endsWith('.js')
+}
+
+function getFilesArray(files: any) {
+  if (!files) {
+    return []
+  }
+  if (isWebpack5) {
+    return Array.from(files)
+  }
+
+  return files
 }
 
 // This plugin creates a build-manifest.json for all assets that are being output
 // It has a mapping of "entry" filename to real filename. Because the real filename can be hashed in production
 export default class BuildManifestPlugin {
   private buildId: string
-  private modern: boolean
+  private rewrites: Rewrite[]
 
-  constructor(options: { buildId: string; modern: boolean }) {
+  constructor(options: { buildId: string; rewrites: Rewrite[] }) {
     this.buildId = options.buildId
-    this.modern = options.modern
+
+    this.rewrites = options.rewrites.map((r) => {
+      const rewrite = { ...r }
+
+      // omit external rewrite destinations since these aren't
+      // handled client-side
+      if (!rewrite.destination.startsWith('/')) {
+        delete (rewrite as any).destination
+      }
+      return rewrite
+    })
   }
 
-  apply(compiler: Compiler) {
-    compiler.hooks.emit.tapAsync(
-      'NextJsBuildManifest',
-      (compilation, callback) => {
-        const { chunks } = compilation
-        const assetMap: BuildManifest = {
+  createAssets(compiler: any, compilation: any, assets: any) {
+    return tracer.withSpan(spans.get(compiler), () => {
+      const span = tracer.startSpan('NextJsBuildManifest-createassets')
+      return traceFn(span, () => {
+        const namedChunks: Map<string, webpack.compilation.Chunk> =
+          compilation.namedChunks
+        const assetMap: DeepMutable<BuildManifest> = {
+          polyfillFiles: [],
           devFiles: [],
+          ampDevFiles: [],
           lowPriorityFiles: [],
           pages: { '/_app': [] },
+          ampFirstPages: [],
         }
 
-        const mainJsChunk = chunks.find(
-          (c) => c.name === CLIENT_STATIC_FILES_RUNTIME_MAIN
-        )
-        const mainJsFiles: string[] =
-          mainJsChunk && mainJsChunk.files.length > 0
-            ? mainJsChunk.files.filter((file: string) => /\.js$/.test(file))
-            : []
+        const ampFirstEntryNames = ampFirstEntryNamesMap.get(compilation)
+        if (ampFirstEntryNames) {
+          for (const entryName of ampFirstEntryNames) {
+            const pagePath = getRouteFromEntrypoint(entryName)
+            if (!pagePath) {
+              continue
+            }
 
-        const polyfillChunk = chunks.find(
-          (c) => c.name === CLIENT_STATIC_FILES_RUNTIME_POLYFILLS
-        )
-        const polyfillFiles: string[] = polyfillChunk ? polyfillChunk.files : []
+            assetMap.ampFirstPages.push(pagePath)
+          }
+        }
 
-        const reactRefreshChunk = chunks.find(
-          (c) => c.name === CLIENT_STATIC_FILES_RUNTIME_REACT_REFRESH
+        const mainJsChunk = namedChunks.get(CLIENT_STATIC_FILES_RUNTIME_MAIN)
+
+        const mainJsFiles: string[] = getFilesArray(mainJsChunk?.files).filter(
+          isJsFile
         )
-        assetMap.devFiles.push(...(reactRefreshChunk?.files ?? []))
+
+        const polyfillChunk = namedChunks.get(
+          CLIENT_STATIC_FILES_RUNTIME_POLYFILLS
+        )
+
+        // Create a separate entry  for polyfills
+        assetMap.polyfillFiles = getFilesArray(polyfillChunk?.files).filter(
+          isJsFile
+        )
+
+        const reactRefreshChunk = namedChunks.get(
+          CLIENT_STATIC_FILES_RUNTIME_REACT_REFRESH
+        )
+        assetMap.devFiles = getFilesArray(reactRefreshChunk?.files).filter(
+          isJsFile
+        )
 
         for (const entrypoint of compilation.entrypoints.values()) {
+          const isAmpRuntime =
+            entrypoint.name === CLIENT_STATIC_FILES_RUNTIME_AMP
+
+          if (isAmpRuntime) {
+            for (const file of entrypoint.getFiles()) {
+              if (!(isJsFile(file) || file.endsWith('.css'))) {
+                continue
+              }
+
+              assetMap.ampDevFiles.push(file.replace(/\\/g, '/'))
+            }
+            continue
+          }
           const pagePath = getRouteFromEntrypoint(entrypoint.name)
 
           if (!pagePath) {
@@ -90,32 +175,15 @@ export default class BuildManifestPlugin {
 
           // getFiles() - helper function to read the files for an entrypoint from stats object
           for (const file of entrypoint.getFiles()) {
-            if (/\.map$/.test(file) || /\.hot-update\.js$/.test(file)) {
-              continue
-            }
-
-            // Only `.js` and `.css` files are added for now. In the future we can also handle other file types.
-            if (!/\.js$/.test(file) && !/\.css$/.test(file)) {
-              continue
-            }
-
-            // The page bundles are manually added to _document.js as they need extra properties
-            if (IS_BUNDLED_PAGE_REGEX.exec(file)) {
+            if (!(isJsFile(file) || file.endsWith('.css'))) {
               continue
             }
 
             filesForEntry.push(file.replace(/\\/g, '/'))
           }
 
-          assetMap.pages[pagePath] = [...filesForEntry, ...mainJsFiles]
+          assetMap.pages[pagePath] = [...mainJsFiles, ...filesForEntry]
         }
-
-        if (typeof assetMap.pages['/index'] !== 'undefined') {
-          assetMap.pages['/'] = assetMap.pages['/index']
-        }
-
-        // Create a separate entry  for polyfills
-        assetMap.pages['/_polyfills'] = polyfillFiles
 
         // Add the runtime build manifest file (generated later in this file)
         // as a dependency for the app. If the flag is false, the file won't be
@@ -123,11 +191,6 @@ export default class BuildManifestPlugin {
         assetMap.lowPriorityFiles.push(
           `${CLIENT_STATIC_FILES_PATH}/${this.buildId}/_buildManifest.js`
         )
-        if (this.modern) {
-          assetMap.lowPriorityFiles.push(
-            `${CLIENT_STATIC_FILES_PATH}/${this.buildId}/_buildManifest.module.js`
-          )
-        }
 
         // Add the runtime ssg manifest file as a lazy-loaded file dependency.
         // We also stub this file out for development mode (when it is not
@@ -136,46 +199,52 @@ export default class BuildManifestPlugin {
 
         const ssgManifestPath = `${CLIENT_STATIC_FILES_PATH}/${this.buildId}/_ssgManifest.js`
         assetMap.lowPriorityFiles.push(ssgManifestPath)
-        compilation.assets[ssgManifestPath] = new RawSource(srcEmptySsgManifest)
-
-        if (this.modern) {
-          const ssgManifestPathModern = `${CLIENT_STATIC_FILES_PATH}/${this.buildId}/_ssgManifest.module.js`
-          assetMap.lowPriorityFiles.push(ssgManifestPathModern)
-          compilation.assets[ssgManifestPathModern] = new RawSource(
-            srcEmptySsgManifest
-          )
-        }
+        assets[ssgManifestPath] = new sources.RawSource(srcEmptySsgManifest)
 
         assetMap.pages = Object.keys(assetMap.pages)
           .sort()
           // eslint-disable-next-line
           .reduce((a, c) => ((a[c] = assetMap.pages[c]), a), {} as any)
 
-        compilation.assets[BUILD_MANIFEST] = new RawSource(
+        assets[BUILD_MANIFEST] = new sources.RawSource(
           JSON.stringify(assetMap, null, 2)
         )
 
         const clientManifestPath = `${CLIENT_STATIC_FILES_PATH}/${this.buildId}/_buildManifest.js`
 
-        compilation.assets[clientManifestPath] = new RawSource(
+        assets[clientManifestPath] = new sources.RawSource(
           `self.__BUILD_MANIFEST = ${generateClientManifest(
+            compiler,
             assetMap,
-            false
+            this.rewrites
           )};self.__BUILD_MANIFEST_CB && self.__BUILD_MANIFEST_CB()`
         )
 
-        if (this.modern) {
-          const modernClientManifestPath = `${CLIENT_STATIC_FILES_PATH}/${this.buildId}/_buildManifest.module.js`
+        return assets
+      })
+    })
+  }
 
-          compilation.assets[modernClientManifestPath] = new RawSource(
-            `self.__BUILD_MANIFEST = ${generateClientManifest(
-              assetMap,
-              true
-            )};self.__BUILD_MANIFEST_CB && self.__BUILD_MANIFEST_CB()`
-          )
-        }
-        callback()
-      }
-    )
+  apply(compiler: webpack.Compiler) {
+    if (isWebpack5) {
+      compiler.hooks.make.tap('NextJsBuildManifest', (compilation) => {
+        // @ts-ignore TODO: Remove ignore when webpack 5 is stable
+        compilation.hooks.processAssets.tap(
+          {
+            name: 'NextJsBuildManifest',
+            // @ts-ignore TODO: Remove ignore when webpack 5 is stable
+            stage: webpack.Compilation.PROCESS_ASSETS_STAGE_ADDITIONS,
+          },
+          (assets: any) => {
+            this.createAssets(compiler, compilation, assets)
+          }
+        )
+      })
+      return
+    }
+
+    compiler.hooks.emit.tap('NextJsBuildManifest', (compilation: any) => {
+      this.createAssets(compiler, compilation, compilation.assets)
+    })
   }
 }

@@ -1,9 +1,4 @@
-import {
-  BUILD_MANIFEST,
-  CLIENT_STATIC_FILES_PATH,
-  REACT_LOADABLE_MANIFEST,
-  SERVER_DIRECTORY,
-} from '../lib/constants'
+import { BUILD_MANIFEST, REACT_LOADABLE_MANIFEST } from '../lib/constants'
 import { join } from 'path'
 import { requirePage } from './require'
 import { BuildManifest } from './get-page-files'
@@ -23,7 +18,6 @@ export type ManifestItem = {
   id: number | string
   name: string
   file: string
-  publicPath: string
 }
 
 type ReactLoadableManifest = { [moduleId: string]: ManifestItem[] }
@@ -42,44 +36,32 @@ export type LoadComponentsReturnType = {
 
 export async function loadComponents(
   distDir: string,
-  buildId: string,
   pathname: string,
   serverless: boolean
 ): Promise<LoadComponentsReturnType> {
   if (serverless) {
     const Component = await requirePage(pathname, distDir, serverless)
-    const { getStaticProps, getStaticPaths, getServerSideProps } = Component
+    let { getStaticProps, getStaticPaths, getServerSideProps } = Component
+
+    getStaticProps = await getStaticProps
+    getStaticPaths = await getStaticPaths
+    getServerSideProps = await getServerSideProps
+    const pageConfig = (await Component.config) || {}
 
     return {
       Component,
-      pageConfig: Component.config || {},
+      pageConfig,
       getStaticProps,
       getStaticPaths,
       getServerSideProps,
     } as LoadComponentsReturnType
   }
-  const documentPath = join(
-    distDir,
-    SERVER_DIRECTORY,
-    CLIENT_STATIC_FILES_PATH,
-    buildId,
-    'pages',
-    '_document'
-  )
-  const appPath = join(
-    distDir,
-    SERVER_DIRECTORY,
-    CLIENT_STATIC_FILES_PATH,
-    buildId,
-    'pages',
-    '_app'
-  )
 
-  const DocumentMod = require(documentPath)
-
-  const AppMod = require(appPath)
-
-  const ComponentMod = requirePage(pathname, distDir, serverless)
+  const [DocumentMod, AppMod, ComponentMod] = await Promise.all([
+    requirePage('/_document', distDir, serverless),
+    requirePage('/_app', distDir, serverless),
+    requirePage(pathname, distDir, serverless),
+  ])
 
   const [
     buildManifest,

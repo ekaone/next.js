@@ -1,7 +1,7 @@
 /* eslint-env jest */
 /* global browserName */
 import cheerio from 'cheerio'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync } from 'fs'
 import {
   nextServer,
   renderViaHTTP,
@@ -9,6 +9,8 @@ import {
   startApp,
   stopApp,
   waitFor,
+  getPageFileFromPagesManifest,
+  check,
 } from 'next-test-utils'
 import webdriver from 'next-webdriver'
 import {
@@ -23,7 +25,6 @@ import dynamicImportTests from './dynamic'
 import processEnv from './process-env'
 import security from './security'
 const appDir = join(__dirname, '../')
-let serverDir
 let appPort
 let server
 let app
@@ -32,22 +33,36 @@ jest.setTimeout(1000 * 60 * 5)
 const context = {}
 
 describe('Production Usage', () => {
+  let output = ''
   beforeAll(async () => {
-    await runNextCommand(['build', appDir])
+    const result = await runNextCommand(['build', appDir], {
+      stderr: true,
+      stdout: true,
+    })
 
     app = nextServer({
       dir: join(__dirname, '../'),
       dev: false,
       quiet: true,
     })
+    output = (result.stderr || '') + (result.stdout || '')
+    console.log(output)
+
+    if (result.code !== 0) {
+      throw new Error(`Failed to build, exited with code ${result.code}`)
+    }
 
     server = await startApp(app)
     context.appPort = appPort = server.address().port
-
-    const buildId = readFileSync(join(appDir, '.next/BUILD_ID'), 'utf8')
-    serverDir = join(appDir, '.next/server/static/', buildId, 'pages')
   })
   afterAll(() => stopApp(server))
+
+  it('should contain generated page count in output', async () => {
+    expect(output).toContain('Generating static pages (0/36)')
+    expect(output).toContain('Generating static pages (36/36)')
+    // we should only have 4 segments and the initial message logged out
+    expect(output.match(/Generating static pages/g).length).toBe(5)
+  })
 
   describe('With basic usage', () => {
     it('should render the page', async () => {
@@ -73,8 +88,44 @@ describe('Production Usage', () => {
       })
     }
 
+    it('should polyfill Node.js modules', async () => {
+      const browser = await webdriver(appPort, '/node-browser-polyfills')
+      await browser.waitForCondition('window.didRender')
+
+      const data = await browser
+        .waitForElementByCss('#node-browser-polyfills')
+        .text()
+      const parsedData = JSON.parse(data)
+
+      expect(parsedData.vm).toBe(105)
+      expect(parsedData.hash).toBe(
+        'b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9'
+      )
+      expect(parsedData.path).toBe('/hello/world/test.txt')
+      expect(parsedData.buffer).toBe('hello world')
+      expect(parsedData.stream).toBe(true)
+    })
+
     it('should allow etag header support', async () => {
       const url = `http://localhost:${appPort}/`
+      const etag = (await fetch(url)).headers.get('ETag')
+
+      const headers = { 'If-None-Match': etag }
+      const res2 = await fetch(url, { headers })
+      expect(res2.status).toBe(304)
+    })
+
+    it('should allow etag header support with getStaticProps', async () => {
+      const url = `http://localhost:${appPort}/fully-static`
+      const etag = (await fetch(url)).headers.get('ETag')
+
+      const headers = { 'If-None-Match': etag }
+      const res2 = await fetch(url, { headers })
+      expect(res2.status).toBe(304)
+    })
+
+    it('should allow etag header support with getServerSideProps', async () => {
+      const url = `http://localhost:${appPort}/fully-dynamic`
       const etag = (await fetch(url)).headers.get('ETag')
 
       const headers = { 'If-None-Match': etag }
@@ -151,29 +202,37 @@ describe('Production Usage', () => {
     })
 
     it('should return 412 on static file when If-Unmodified-Since is provided and file is modified', async () => {
-      const buildId = readFileSync(join(__dirname, '../.next/BUILD_ID'), 'utf8')
+      const buildManifest = require(join(
+        __dirname,
+        '../.next/build-manifest.json'
+      ))
 
-      const res = await fetch(
-        `http://localhost:${appPort}/_next/static/${buildId}/pages/index.js`,
-        {
+      const files = buildManifest.pages['/']
+
+      for (const file of files) {
+        const res = await fetch(`http://localhost:${appPort}/_next/${file}`, {
           method: 'GET',
           headers: { 'if-unmodified-since': 'Fri, 12 Jul 2019 20:00:13 GMT' },
-        }
-      )
-      expect(res.status).toBe(412)
+        })
+        expect(res.status).toBe(412)
+      }
     })
 
     it('should return 200 on static file if If-Unmodified-Since is invalid date', async () => {
-      const buildId = readFileSync(join(__dirname, '../.next/BUILD_ID'), 'utf8')
+      const buildManifest = require(join(
+        __dirname,
+        '../.next/build-manifest.json'
+      ))
 
-      const res = await fetch(
-        `http://localhost:${appPort}/_next/static/${buildId}/pages/index.js`,
-        {
+      const files = buildManifest.pages['/']
+
+      for (const file of files) {
+        const res = await fetch(`http://localhost:${appPort}/_next/${file}`, {
           method: 'GET',
           headers: { 'if-unmodified-since': 'nextjs' },
-        }
-      )
-      expect(res.status).toBe(200)
+        })
+        expect(res.status).toBe(200)
+      }
     })
 
     it('should set Content-Length header', async () => {
@@ -183,7 +242,6 @@ describe('Production Usage', () => {
     })
 
     it('should set Cache-Control header', async () => {
-      const buildId = readFileSync(join(__dirname, '../.next/BUILD_ID'), 'utf8')
       const buildManifest = require(join('../.next', BUILD_MANIFEST))
       const reactLoadableManifest = require(join(
         '../.next',
@@ -193,12 +251,9 @@ describe('Production Usage', () => {
 
       const resources = new Set()
 
-      // test a regular page
-      resources.add(`${url}static/${buildId}/pages/index.js`)
-
       // test dynamic chunk
       resources.add(
-        url + reactLoadableManifest['../../components/hello1'][0].publicPath
+        url + reactLoadableManifest['../../components/hello1'][0].file
       )
 
       // test main.js runtime etc
@@ -317,6 +372,50 @@ describe('Production Usage', () => {
       expect(text).toBe('Hello World')
       await browser.close()
     })
+
+    it('should set title by routeChangeComplete event', async () => {
+      const browser = await webdriver(appPort, '/')
+      await browser.eval(function setup() {
+        window.next.router.events.on('routeChangeComplete', function handler(
+          url
+        ) {
+          window.routeChangeTitle = document.title
+          window.routeChangeUrl = url
+        })
+        window.next.router.push('/with-title')
+      })
+      await browser.waitForElementByCss('#with-title')
+
+      const title = await browser.eval(`window.routeChangeTitle`)
+      const url = await browser.eval(`window.routeChangeUrl`)
+      expect(title).toBe('hello from title')
+      expect(url).toBe('/with-title')
+    })
+
+    it('should reload page successfully (on bad link)', async () => {
+      const browser = await webdriver(appPort, '/to-nonexistent')
+      await browser.eval(function setup() {
+        window.__DATA_BE_GONE = 'true'
+      })
+      await browser.waitForElementByCss('#to-nonexistent-page')
+      await browser.click('#to-nonexistent-page')
+      await browser.waitForElementByCss('.about-page')
+
+      const oldData = await browser.eval(`window.__DATA_BE_GONE`)
+      expect(oldData).toBeFalsy()
+    })
+
+    it('should reload page successfully (on bad data fetch)', async () => {
+      const browser = await webdriver(appPort, '/to-shadowed-page')
+      await browser.eval(function setup() {
+        window.__DATA_BE_GONE = 'true'
+      })
+      await browser.waitForElementByCss('#to-shadowed-page').click()
+      await browser.waitForElementByCss('.about-page')
+
+      const oldData = await browser.eval(`window.__DATA_BE_GONE`)
+      expect(oldData).toBeFalsy()
+    })
   })
 
   it('should navigate to external site and back', async () => {
@@ -334,6 +433,23 @@ describe('Production Usage', () => {
     await waitFor(1000)
     const newText = await browser.elementByCss('p').text()
     expect(newText).toBe('server')
+  })
+
+  it('should navigate to page with CSS and back', async () => {
+    const browser = await webdriver(appPort, '/css-and-back')
+    const initialText = await browser.elementByCss('p').text()
+    expect(initialText).toBe('server')
+
+    await browser
+      .elementByCss('a')
+      .click()
+      .waitForElementByCss('input')
+      .back()
+      .waitForElementByCss('p')
+
+    await waitFor(1000)
+    const newText = await browser.elementByCss('p').text()
+    expect(newText).toBe('client')
   })
 
   it('should navigate to external site and back (with query)', async () => {
@@ -562,16 +678,6 @@ describe('Production Usage', () => {
 
         // Let the browser to prefetch the page and error it on the console.
         await waitFor(3000)
-        const browserLogs = await browser.log('browser')
-        let foundLog = false
-        browserLogs.forEach((log) => {
-          if (
-            log.message.match(/\/no-such-page\.js - Failed to load resource/)
-          ) {
-            foundLog = true
-          }
-        })
-        expect(foundLog).toBe(true)
 
         // When we go to the 404 page, it'll do a hard reload.
         // So, it's possible for the front proxy to load a page from another zone.
@@ -622,24 +728,27 @@ describe('Production Usage', () => {
   })
 
   it('should handle failed param decoding', async () => {
-    const html = await renderViaHTTP(appPort, '/%DE~%C7%1fY/')
+    const html = await renderViaHTTP(appPort, '/invalid-param/%DE~%C7%1fY/')
     expect(html).toMatch(/400/)
     expect(html).toMatch(/Bad Request/)
   })
 
   it('should replace static pages with HTML files', async () => {
-    const staticFiles = ['about', 'another', 'counter', 'dynamic', 'prefetch']
-    for (const file of staticFiles) {
-      expect(existsSync(join(serverDir, file + '.html'))).toBe(true)
-      expect(existsSync(join(serverDir, file + '.js'))).toBe(false)
+    const pages = ['/about', '/another', '/counter', '/dynamic', '/prefetch']
+    for (const page of pages) {
+      const file = getPageFileFromPagesManifest(appDir, page)
+
+      expect(file.endsWith('.html')).toBe(true)
     }
   })
 
   it('should not replace non-static pages with HTML files', async () => {
-    const nonStaticFiles = ['api', 'external-and-back', 'finish-response']
-    for (const file of nonStaticFiles) {
-      expect(existsSync(join(serverDir, file + '.js'))).toBe(true)
-      expect(existsSync(join(serverDir, file + '.html'))).toBe(false)
+    const pages = ['/api', '/external-and-back', '/finish-response']
+
+    for (const page of pages) {
+      const file = getPageFileFromPagesManifest(appDir, page)
+
+      expect(file.endsWith('.js')).toBe(true)
     }
   })
 
@@ -671,6 +780,10 @@ describe('Production Usage', () => {
 
   it('should not emit profiling events', async () => {
     expect(existsSync(join(appDir, '.next', 'profile-events.json'))).toBe(false)
+  })
+
+  it('should not emit stats', async () => {
+    expect(existsSync(join(appDir, '.next', 'next-stats.json'))).toBe(false)
   })
 
   it('should contain the Next.js version in window export', async () => {
@@ -750,6 +863,27 @@ describe('Production Usage', () => {
       }
     }
     expect(missing).toBe(false)
+  })
+
+  it('should preserve query when hard navigating from page 404', async () => {
+    const browser = await webdriver(appPort, '/')
+    await browser.eval(`(function() {
+      window.beforeNav = 1
+      window.next.router.push({
+        pathname: '/non-existent',
+        query: { hello: 'world' }
+      })
+    })()`)
+
+    await check(
+      () => browser.eval('document.documentElement.innerHTML'),
+      /page could not be found/
+    )
+
+    expect(await browser.eval('window.beforeNav')).toBe(null)
+    expect(await browser.eval('window.location.hash')).toBe('')
+    expect(await browser.eval('window.location.search')).toBe('?hello=world')
+    expect(await browser.eval('window.location.pathname')).toBe('/non-existent')
   })
 
   dynamicImportTests(context, (p, q) => renderViaHTTP(context.appPort, p, q))

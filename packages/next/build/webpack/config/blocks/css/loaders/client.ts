@@ -1,4 +1,4 @@
-import webpack from 'webpack'
+import { webpack } from 'next/dist/compiled/webpack/webpack'
 import MiniCssExtractPlugin from '../../../../plugins/mini-css-extract-plugin'
 
 export function getClientStyleLoader({
@@ -10,7 +10,7 @@ export function getClientStyleLoader({
 }): webpack.RuleSetUseItem {
   return isDevelopment
     ? {
-        loader: require.resolve('style-loader'),
+        loader: 'next-style-loader',
         options: {
           // By default, style-loader injects CSS into the bottom
           // of <head>. This causes ordering problems between dev
@@ -29,29 +29,11 @@ export function getClientStyleLoader({
             // anchor. By inserting before and not after, we do not
             // need to track the last inserted element.
             parentNode.insertBefore(element, anchorElement)
-
-            // Remember: this is development only code.
-            //
-            // After styles are injected, we need to remove the
-            // <style> tags that set `body { display: none; }`.
-            //
-            // We use `requestAnimationFrame` as a way to defer
-            // this operation since there may be multiple style
-            // tags.
-            ;(self.requestAnimationFrame || setTimeout)(function () {
-              for (
-                var x = document.querySelectorAll('[data-next-hide-fouc]'),
-                  i = x.length;
-                i--;
-
-              ) {
-                x[i].parentNode!.removeChild(x[i])
-              }
-            })
           },
         },
       }
     : {
+        // @ts-ignore: TODO: remove when webpack 5 is stable
         loader: MiniCssExtractPlugin.loader,
         options: { publicPath: `${assetPrefix}/_next/` },
       }
